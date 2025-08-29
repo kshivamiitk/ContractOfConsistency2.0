@@ -7,6 +7,9 @@ import ChecklistPage from './pages/ChecklistPage';
 import SearchPage from './pages/SearchPage';
 import Navbar from './components/Navbar';
 import MyFinesPage from './pages/MyFinesPage';
+import TaskRegistryPage from './pages/TaskRegistryPage.jsx';
+import DayProfilePage from './pages/DayProfilePage.jsx';
+import TodayOthersPage from './pages/TodayOthersPage.jsx';
 export default function App() {
   const [session, setSession] = useState(null);
   const navigate = useNavigate();
@@ -37,6 +40,9 @@ export default function App() {
           <Route path="/checklist" element={<ChecklistPage />} />
           <Route path="/search" element={<SearchPage />} />
           <Route path="/fines" element={<MyFinesPage/>}/>
+          <Route path="/day-profile" element={<DayProfilePage />} />
+          {/* <Route path="/today-others" element={<TodayOthersPage />} /> */}
+          <Route path="/tasks" element={<TaskRegistryPage />} />
           <Route path="/" element={<LoginPage />} />
         </Routes>
       </main>

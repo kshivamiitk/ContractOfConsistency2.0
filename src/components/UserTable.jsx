@@ -3,6 +3,14 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { supabase } from '../supabaseClient';
 import dayjs from 'dayjs';
 
+/*
+UserTable.jsx
+- Loads daily_checks, fines, suspensions for the selected user
+- Classifies checklist items into columns; has robust fallback to detect class items
+- If a date is excused (suspension covers date) it shows Excused badge and sets fines total to 0
+- Listens for 'contract:changed' events and can Refresh
+*/
+
 export default function UserTable({ userId }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -14,41 +22,37 @@ export default function UserTable({ userId }) {
       setLoading(false);
       return;
     }
-
     setLoading(true);
     setErrorMsg(null);
 
     try {
-      // 1) daily_checks
+      // daily_checks
       const { data: checksData, error: checksErr } = await supabase
         .from('daily_checks')
         .select('*')
         .eq('user_id', userId)
         .order('date', { ascending: false });
-
       if (checksErr) throw checksErr;
 
-      // 2) fines
+      // fines
       const { data: finesData, error: finesErr } = await supabase
         .from('fines')
         .select('*')
         .eq('user_id', userId)
         .order('date', { ascending: false });
-
       if (finesErr) throw finesErr;
 
-      // 3) suspensions
+      // suspensions
       const { data: suspData, error: suspErr } = await supabase
         .from('suspensions')
         .select('*')
         .eq('user_id', userId);
-
       if (suspErr) throw suspErr;
 
       const fines = finesData || [];
       const suspensions = suspData || [];
 
-      // group fines by daily_check_id or by date
+      // group fines
       const finesByDailyId = {};
       const finesByDate = {};
       fines.forEach(f => {
@@ -62,22 +66,19 @@ export default function UserTable({ userId }) {
         }
       });
 
-      // group suspensions by date (plugin-free)
+      // group suspensions into a map date->suspension (handles multi-day)
       const suspByDate = {};
       suspensions.forEach(s => {
         const start = dayjs(s.start_date);
         const end = dayjs(s.end_date);
-        // compute number of days difference (inclusive)
-        const diffDays = end.diff(start, 'day');
-        // if end is before start, still map start date at least
-        const maxIndex = diffDays >= 0 ? diffDays : 0;
-        for (let i = 0; i <= maxIndex; i++) {
+        const diffDays = Math.max(0, end.diff(start, 'day'));
+        for (let i = 0; i <= diffDays; i++) {
           const d = start.add(i, 'day');
           suspByDate[d.format('YYYY-MM-DD')] = s;
         }
       });
 
-      // transform checks into table rows
+      // transform checks into rows
       const transformed = (checksData || []).map(dc => {
         const ch = dc.checks || {};
         const theory = [];
@@ -104,6 +105,7 @@ export default function UserTable({ userId }) {
 
           const short = `${label} ${done ? '✓' : '✗'}`;
 
+          // classification: prefer explicit meta.type, then key prefix, then label heuristics
           if (metaType === 'theory' || k.startsWith('theory')) theory.push(short);
           else if (metaType === 'sport' || k.startsWith('sport')) sports.push(short);
           else if (metaType === 'class' || k.startsWith('class')) classes.push(short);
@@ -112,7 +114,7 @@ export default function UserTable({ userId }) {
           else if (metaType === 'wake' || k === 'wake') wake.push(short);
           else {
             const low = (label || '').toLowerCase();
-            if (low.includes('class')) classes.push(short);
+            if (low.includes('class')) classes.push(short); // fallback
             else if (low.includes('wake')) wake.push(short);
             else if (low.includes('random') || low.includes('implementation')) randImpl.push(short);
             else theory.push(short);
@@ -163,17 +165,15 @@ export default function UserTable({ userId }) {
     } catch (err) {
       console.error('UserTable load error', err);
       setErrorMsg(err.message || String(err));
-      setRows([]); // ensure rows cleared on error
+      setRows([]);
     } finally {
       setLoading(false);
     }
   }, [userId]);
 
   useEffect(() => {
-    // initial load
     load();
 
-    // listen for contract changes from other components (DailyChecklist)
     const handler = (ev) => {
       try {
         const detail = ev?.detail;

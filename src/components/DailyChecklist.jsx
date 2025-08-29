@@ -5,39 +5,43 @@ import dayjs from 'dayjs';
 
 /*
 DailyChecklist.jsx
-- Builds a per-day checklist from user's preferences (theory, sports, classes, random, wake).
-- Allows saving today's checklist; creates fines for missed items (deleted/replaced on re-save).
-- "Missed the contract" modal: creates a one-day suspension (excuse) which prevents fines for that date.
-- Revoking an excuse will remove the suspension (fines may be re-created if you save the checklist again).
-- Dispatches a window event 'contract:changed' after major changes so other views (e.g. Search) can refresh.
+- Builds daily checklist from prefs (theory, sports, classes, random, wake)
+- Ensures each saved checklist item includes meta.type (class/theory/sport/etc)
+- Saves daily_checks (upsert), deletes previous fines for that daily_check/date, inserts new fines
+- Missed-the-contract modal creates a suspension (excuse) and deletes fines for that date
+- Dispatches window event 'contract:changed' after changes so the Search page refreshes
 */
 
 function keyFor(prefix, idx) {
   return `${prefix}_${idx}`;
 }
 
+function normalizeDaysField(days) {
+  if (!days) return [];
+  if (Array.isArray(days)) return days.map(d => String(d).toLowerCase().slice(0,3));
+  return String(days).split(',').map(s => s.trim()).filter(Boolean).map(s => s.toLowerCase().slice(0,3));
+}
+
 export default function DailyChecklist({ user, prefs }) {
   const [date, setDate] = useState(dayjs().format('YYYY-MM-DD'));
   const [checks, setChecks] = useState({});
-  const [status, setStatus] = useState('');
   const [todayFines, setTodayFines] = useState([]);
   const [suspensionForDate, setSuspensionForDate] = useState(null);
+  const [status, setStatus] = useState('');
+  const [loading, setLoading] = useState(false);
 
-  // modal state for missed contract
+  // modal / excuse state
   const [showExcuseModal, setShowExcuseModal] = useState(false);
   const [excuseReason, setExcuseReason] = useState('');
   const [excuseProcessing, setExcuseProcessing] = useState(false);
 
-  const [loading, setLoading] = useState(false);
-
-  // Load daily check / fines / suspension for the date/user
   useEffect(() => {
     let mounted = true;
-    const load = async () => {
+    async function load() {
       setLoading(true);
       setStatus('');
       try {
-        // load daily_check row
+        // load existing daily_check
         const { data: dc, error: dcErr } = await supabase
           .from('daily_checks')
           .select('*')
@@ -48,11 +52,10 @@ export default function DailyChecklist({ user, prefs }) {
         if (dcErr) throw dcErr;
 
         if (mounted) {
-          if (dc) setChecks(dc.checks || buildEmptyChecksFromPrefs(prefs, date));
-          else setChecks(buildEmptyChecksFromPrefs(prefs, date));
+          setChecks(dc ? dc.checks || buildEmptyChecksFromPrefs(prefs, date) : buildEmptyChecksFromPrefs(prefs, date));
         }
 
-        // load fines for that date
+        // load fines for this date
         const { data: fines, error: finesErr } = await supabase
           .from('fines')
           .select('*')
@@ -63,7 +66,7 @@ export default function DailyChecklist({ user, prefs }) {
         if (finesErr) throw finesErr;
         if (mounted) setTodayFines(fines || []);
 
-        // load suspension (if any covers the date)
+        // load suspension for date (if any)
         const { data: susp, error: suspErr } = await supabase
           .from('suspensions')
           .select('*')
@@ -80,29 +83,23 @@ export default function DailyChecklist({ user, prefs }) {
       } finally {
         if (mounted) setLoading(false);
       }
-    };
+    }
 
     load();
     return () => { mounted = false; };
   }, [date, user.id, prefs]);
 
-  function normalizeDaysField(days) {
-    if (!days) return [];
-    if (Array.isArray(days)) return days.map(d => String(d).toLowerCase().slice(0,3));
-    return String(days).split(',').map(s => s.trim()).filter(Boolean).map(s => s.toLowerCase().slice(0,3));
-  }
-
   function buildEmptyChecksFromPrefs(prefsObj, dateStr) {
     const result = {};
-    const todayWeek = dayjs(dateStr).format('ddd').toLowerCase().slice(0,3); // e.g. 'mon'
+    const todayWeek = dayjs(dateStr).format('ddd').toLowerCase().slice(0,3); // e.g., 'mon'
 
     // Theory tasks
     (prefsObj?.theory_tasks || []).forEach((t, idx) => {
       result[keyFor('theory', idx)] = {
         done: false,
-        label: `${(t.topic || 'topic').toUpperCase()} ${(t.platform || 'platform').toUpperCase()} ${t.count || 1} problems`,
+        label: `${String(t.topic || 'topic').toUpperCase()} ${String(t.platform || 'platform').toUpperCase()} ${t.count || 1} problems`,
         penalty: t.penalty ?? 10,
-        meta: { type: 'theory', idx }
+        meta: { type: 'theory', ref: t.id || null }
       };
     });
 
@@ -112,11 +109,11 @@ export default function DailyChecklist({ user, prefs }) {
         done: false,
         label: `${s.sport || 'sport'} for ${s.duration_minutes || 60} mins (${s.start_time || '00:00'} - ${s.end_time || '00:00'})`,
         penalty: s.penalty ?? 10,
-        meta: { type: 'sport', idx }
+        meta: { type: 'sport', ref: s.id || null }
       };
     });
 
-    // Classes: include only if this weekday matches
+    // Classes: only include if this weekday is selected for class
     (prefsObj?.classes_tasks || []).forEach((c, idx) => {
       const days = normalizeDaysField(c.days);
       if (days.includes(todayWeek)) {
@@ -124,7 +121,7 @@ export default function DailyChecklist({ user, prefs }) {
           done: false,
           label: `Class: ${c.name || 'class'} (${c.start_time || '00:00'} - ${c.end_time || '00:00'})`,
           penalty: c.penalty ?? 10,
-          meta: { type: 'class', idx }
+          meta: { type: 'class', ref: c.id || null, days }
         };
       }
     });
@@ -133,9 +130,9 @@ export default function DailyChecklist({ user, prefs }) {
     (prefsObj?.random_implementation || []).forEach((r, idx) => {
       result[keyFor('randimpl', idx)] = {
         done: false,
-        label: `Random implementation: ${(r.platform || 'platform').toUpperCase()} ${r.count || 1} problems`,
+        label: `Random implementation: ${String(r.platform || 'platform').toUpperCase()} ${r.count || 1} problems`,
         penalty: r.penalty ?? 10,
-        meta: { type: 'randimpl', idx }
+        meta: { type: 'randimpl', ref: r.id || null }
       };
     });
 
@@ -143,13 +140,13 @@ export default function DailyChecklist({ user, prefs }) {
     (prefsObj?.random_thinking || []).forEach((r, idx) => {
       result[keyFor('randthink', idx)] = {
         done: false,
-        label: `Random thinking: ${(r.platform || 'platform').toUpperCase()} ${r.count || 1} problems`,
+        label: `Random thinking: ${String(r.platform || 'platform').toUpperCase()} ${r.count || 1} problems`,
         penalty: r.penalty ?? 10,
-        meta: { type: 'randthink', idx }
+        meta: { type: 'randthink', ref: r.id || null }
       };
     });
 
-    // Wake rule
+    // Wake
     if (prefsObj?.wake_rule && Object.keys(prefsObj.wake_rule || {}).length) {
       const w = prefsObj.wake_rule;
       result['wake'] = {
@@ -179,58 +176,41 @@ export default function DailyChecklist({ user, prefs }) {
     return !!v;
   }
 
-  // Save checklist and create fines for unchecked items
+  // Save checklist (upsert) and create fines (after deleting existing fines for that date/dc)
   async function submitChecks() {
     setStatus('Saving checklist...');
     setLoading(true);
-    const serialized = checks;
-
     try {
       const payload = {
         user_id: user.id,
         date,
-        checks: serialized
+        checks
       };
 
-      // Upsert daily_checks to obtain a stable row and id
       const { data, error } = await supabase
         .from('daily_checks')
         .upsert(payload, { onConflict: ['user_id', 'date'], returning: 'representation' })
         .select()
         .maybeSingle();
 
-      if (error) {
-        throw error;
-      }
-
+      if (error) throw error;
       const savedDc = data;
       if (!savedDc) {
         setStatus('Saved but could not read saved row; aborting fines creation.');
         return;
       }
 
-      // Delete any existing fines linked to this daily_check (and legacy date-only fines)
+      // delete previous fines for this daily_check and legacy date-only fines
       try {
         if (savedDc.id) {
-          await supabase
-            .from('fines')
-            .delete()
-            .eq('user_id', user.id)
-            .eq('daily_check_id', savedDc.id);
+          await supabase.from('fines').delete().eq('user_id', user.id).eq('daily_check_id', savedDc.id);
         }
-        // delete legacy fines with null daily_check_id for the same date
-        await supabase
-          .from('fines')
-          .delete()
-          .eq('user_id', user.id)
-          .is('daily_check_id', null)
-          .eq('date', date);
+        await supabase.from('fines').delete().eq('user_id', user.id).is('daily_check_id', null).eq('date', date);
       } catch (delErr) {
-        console.error('Error deleting previous fines for this date/dc:', delErr);
-        // continue even if delete fails (best-effort)
+        console.error('Error deleting previous fines:', delErr);
       }
 
-      // Check for suspension (excuse) for the date
+      // check suspensions (excuse)
       const { data: susp, error: suspErr } = await supabase
         .from('suspensions')
         .select('*')
@@ -241,7 +221,7 @@ export default function DailyChecklist({ user, prefs }) {
       if (suspErr) throw suspErr;
       const isSuspended = (susp && susp.length > 0);
 
-      // Prepare fines for unchecked items (skip if suspended)
+      // create fines for unchecked items (skip if suspended)
       const finesToInsert = [];
       const now = dayjs();
       const dateStart = dayjs(date).startOf('day');
@@ -249,7 +229,7 @@ export default function DailyChecklist({ user, prefs }) {
       const late = diffHours > 24;
 
       if (!isSuspended) {
-        Object.entries(serialized).forEach(([k, v]) => {
+        Object.entries(checks).forEach(([k, v]) => {
           const done = (typeof v === 'object') ? !!v.done : !!v;
           if (!done) {
             const penalty = (v && v.penalty) ? Number(v.penalty) : 10;
@@ -269,13 +249,17 @@ export default function DailyChecklist({ user, prefs }) {
       if (finesToInsert.length > 0) {
         const { error: finesError } = await supabase.from('fines').insert(finesToInsert);
         if (finesError) throw finesError;
-        setStatus('Saved checklist and fines recorded for missed items.');
+        setStatus('Saved checklist and recorded fines for missed items.');
       } else {
         setStatus(isSuspended ? 'Saved — rules suspended for this date (no fines).' : 'Saved checklist — no fines for this date.');
       }
 
-      // reload today's fines and suspension state
-      const { data: finesReload } = await supabase.from('fines').select('*').eq('user_id', user.id).eq('date', date);
+      // reload fines and suspension
+      const { data: finesReload } = await supabase
+        .from('fines')
+        .select('*')
+        .eq('user_id', user.id)
+        .eq('date', date);
       setTodayFines(finesReload || []);
 
       const { data: suspReload } = await supabase
@@ -288,12 +272,12 @@ export default function DailyChecklist({ user, prefs }) {
 
       setSuspensionForDate((suspReload && suspReload.length > 0) ? suspReload[0] : null);
 
-      // notify other views that contract state changed (so Search/UserTable refreshes)
+      // notify other views
       try {
         window.dispatchEvent(new CustomEvent('contract:changed', { detail: { userId: user.id, date } }));
       } catch (evErr) {
-        // non-fatal
-        console.warn('Could not dispatch contract:changed event', evErr);
+        // ignore if dispatch fails
+        console.warn('contract:changed dispatch failed', evErr);
       }
     } catch (err) {
       console.error('submitChecks error', err);
@@ -303,7 +287,7 @@ export default function DailyChecklist({ user, prefs }) {
     }
   }
 
-  // Missed-the-contract: create one-day suspension and delete fines for that date
+  // Missed contract - create a one-day suspension, delete fines for that date
   async function confirmMissedContract() {
     if (!excuseReason || excuseReason.trim().length < 3) {
       setStatus('Please provide a short reason (3+ chars).');
@@ -311,9 +295,7 @@ export default function DailyChecklist({ user, prefs }) {
     }
     setExcuseProcessing(true);
     setStatus('Applying missed-contract excuse...');
-
     try {
-      // insert suspension
       const { data: insData, error: insErr } = await supabase
         .from('suspensions')
         .insert([{
@@ -327,7 +309,7 @@ export default function DailyChecklist({ user, prefs }) {
 
       if (insErr) throw insErr;
 
-      // delete fines linked to daily_check (if any) and legacy date-only fines
+      // delete fines for this date (linked and legacy)
       try {
         const { data: dc } = await supabase
           .from('daily_checks')
@@ -344,7 +326,6 @@ export default function DailyChecklist({ user, prefs }) {
         console.error('Error deleting fines after excuse', delErr);
       }
 
-      // reload fines and suspension
       const { data: fines } = await supabase.from('fines').select('*').eq('user_id', user.id).eq('date', date);
       setTodayFines(fines || []);
 
@@ -375,10 +356,9 @@ export default function DailyChecklist({ user, prefs }) {
     }
   }
 
-  // Revoke the suspension for this date
   async function revokeSuspension() {
     if (!suspensionForDate) {
-      setStatus('No suspension exists to revoke.');
+      setStatus('No suspension to revoke.');
       return;
     }
     setStatus('Revoking excuse...');
@@ -386,18 +366,16 @@ export default function DailyChecklist({ user, prefs }) {
     try {
       const { error } = await supabase.from('suspensions').delete().eq('id', suspensionForDate.id);
       if (error) throw error;
-
-      // reload fines and suspension state
       const { data: fines } = await supabase.from('fines').select('*').eq('user_id', user.id).eq('date', date);
       setTodayFines(fines || []);
       setSuspensionForDate(null);
-      setStatus('Excuse revoked. Note: saving the checklist again may re-create fines for missed items.');
+      setStatus('Excuse revoked; if there are unchecked items saving the checklist again will recreate fines.');
 
       // notify other views
       try {
         window.dispatchEvent(new CustomEvent('contract:changed', { detail: { userId: user.id, date } }));
       } catch (evErr) {
-        console.warn('Could not dispatch contract:changed event', evErr);
+        console.warn('dispatch failed', evErr);
       }
     } catch (err) {
       console.error('revokeSuspension error', err);
@@ -407,7 +385,7 @@ export default function DailyChecklist({ user, prefs }) {
     }
   }
 
-  const keys = Object.keys(checks);
+  const keys = Object.keys(checks || {});
 
   return (
     <div style={{ maxWidth: 980 }}>

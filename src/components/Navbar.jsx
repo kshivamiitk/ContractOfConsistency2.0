@@ -13,7 +13,12 @@ export default function Navbar({ session }) {
       <Link to="/preferences">Preferences</Link>
       <Link to="/checklist">Checklist</Link>
       <Link to="/search">Search</Link>
+      <Link to="/tasks">Task Registry</Link>
+      <Link to="/day-profile">Profile by Day</Link>
+      {/* <Link to="/today-others">Tasks done today (others)</Link> */}
+
       <Link to="/fines">My fines</Link>
+
       <div style={{ marginLeft: 'auto' }}>
         {session ? (
           <>
