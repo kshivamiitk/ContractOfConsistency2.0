@@ -15,6 +15,11 @@ export default function Navbar({ session }) {
       <Link to="/search">Search</Link>
       <Link to="/tasks">Task Registry</Link>
       <Link to="/day-profile">Profile by Day</Link>
+      <Link to="/diary">Diary</Link>
+<Link to="/calendar">Calendar</Link>
+<Link to="/chat">Chat</Link>
+<Link to="/pomodoro">Pomodoro</Link>
+
       {/* <Link to="/today-others">Tasks done today (others)</Link> */}
 
       <Link to="/fines">My fines</Link>
