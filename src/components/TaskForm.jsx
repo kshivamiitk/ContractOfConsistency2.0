@@ -25,6 +25,11 @@ export default function TaskForm({ user, task, onSaved, onCancel }) {
     setError('');
     if (!user) return setError('You must be logged in to create tasks.');
     if (!title.trim()) return setError('Title required.');
+
+    // if both times given, ensure end > start
+    if (startTime && endTime && new Date(endTime) <= new Date(startTime)) {
+      return setError('End time must be after start time.');
+    }
     setSaving(true);
 
     try {
@@ -38,56 +43,53 @@ export default function TaskForm({ user, task, onSaved, onCancel }) {
       };
 
       if (task && task.id) {
-        // update
-        const { error } = await supabase.from('tasks').update(payload).eq('id', task.id).select().maybeSingle();
+        const { error } = await supabase.from('tasks').update(payload).eq('id', task.id);
         if (error) throw error;
       } else {
-        // insert
         const { error } = await supabase.from('tasks').insert([payload]);
         if (error) throw error;
       }
 
-      // notify and clear
       if (onSaved) onSaved();
       setTitle(''); setDescription(''); setStartTime(''); setEndTime(''); setDuration(25);
     } catch (err) {
       console.error('TaskForm save error', err);
       setError(err.message || String(err));
-    } finally {
-      setSaving(false);
-    }
+    } finally { setSaving(false); }
   }
 
   return (
-    <form onSubmit={handleSubmit}>
-      <label style={{ display: 'block', marginTop: 8 }}>Title</label>
+    <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <label style={{ fontSize: 13 }}>Title</label>
       <input value={title} onChange={(e) => setTitle(e.target.value)} required style={inputStyle} />
 
-      <label style={{ display: 'block', marginTop: 8 }}>Description</label>
-      <textarea value={description} onChange={(e) => setDescription(e.target.value)} style={{ ...inputStyle, height: 80 }} />
+      <label style={{ fontSize: 13 }}>Description</label>
+      <textarea value={description} onChange={(e) => setDescription(e.target.value)} style={{ ...inputStyle, height: 96 }} />
 
       <div style={{ display: 'flex', gap: 8 }}>
         <div style={{ flex: 1 }}>
-          <label style={{ display: 'block', marginTop: 8 }}>Start time (optional)</label>
+          <label style={{ fontSize: 13 }}>Start time (optional)</label>
           <input type="datetime-local" value={startTime} onChange={(e) => setStartTime(e.target.value)} style={inputStyle} />
         </div>
         <div style={{ flex: 1 }}>
-          <label style={{ display: 'block', marginTop: 8 }}>End time (optional)</label>
+          <label style={{ fontSize: 13 }}>End time (optional)</label>
           <input type="datetime-local" value={endTime} onChange={(e) => setEndTime(e.target.value)} style={inputStyle} />
         </div>
       </div>
 
-      <label style={{ display: 'block', marginTop: 8 }}>Duration (minutes)</label>
-      <input type="number" min="1" value={duration} onChange={(e) => setDuration(e.target.value)} style={inputStyle} />
+      <div>
+        <label style={{ fontSize: 13 }}>Duration (minutes)</label>
+        <input type="number" min="1" value={duration} onChange={(e) => setDuration(e.target.value)} style={{ ...inputStyle, width: 140 }} />
+      </div>
 
-      {error && <div style={{ color: 'crimson', marginTop: 8 }}>{error}</div>}
+      {error && <div style={{ color: 'crimson' }}>{error}</div>}
 
-      <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
-        <button type="submit" disabled={saving}>{saving ? 'Saving...' : (task ? 'Update' : 'Create')}</button>
-        {onCancel && <button type="button" onClick={onCancel}>Cancel</button>}
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button type="submit" disabled={saving} style={{ padding: '8px 12px', borderRadius: 8 }}>{saving ? 'Saving...' : (task ? 'Update' : 'Create')}</button>
+        {onCancel && <button type="button" onClick={onCancel} style={{ padding: '8px 12px', borderRadius: 8, background: '#f3f4f6' }}>Cancel</button>}
       </div>
     </form>
   );
 }
 
-const inputStyle = { width: '100%', padding: 8, boxSizing: 'border-box', marginTop: 4 };
+const inputStyle = { width: '100%', padding: 10, borderRadius: 8, border: '1px solid #e6eef6', boxSizing: 'border-box' };

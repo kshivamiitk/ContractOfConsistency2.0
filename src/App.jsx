@@ -14,6 +14,7 @@ import DiaryPage from './pages/DiaryPage';
 import CalendarPage from './pages/CalendarPage';
 import ChatPage from './pages/ChatPage';
 import Pomodoro from './components/Pomodoro';
+import ConsistencyGraphGlobal from './components/ConsistencyGraph';
 
 export default function App() {
   const [session, setSession] = useState(null);
@@ -51,8 +52,7 @@ export default function App() {
 <Route path="/calendar" element={<CalendarPage session={session} />} />
 <Route path="/chat" element={<ChatPage session={session} />} />\
 <Route path="/pomodoro" element={<Pomodoro />} />
-
-
+<Route path="/consistency" element={<ConsistencyGraphGlobal />} />
           <Route path="/" element={<LoginPage />} />
         </Routes>
       </main>

@@ -19,6 +19,7 @@ export default function Navbar({ session }) {
 <Link to="/calendar">Calendar</Link>
 <Link to="/chat">Chat</Link>
 <Link to="/pomodoro">Pomodoro</Link>
+<Link to="/consistency">Consistency</Link>
 
       {/* <Link to="/today-others">Tasks done today (others)</Link> */}
 
