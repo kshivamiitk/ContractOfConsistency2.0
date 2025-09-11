@@ -10,6 +10,11 @@ import MyFinesPage from './pages/MyFinesPage';
 import TaskRegistryPage from './pages/TaskRegistryPage.jsx';
 import DayProfilePage from './pages/DayProfilePage.jsx';
 import TodayOthersPage from './pages/TodayOthersPage.jsx';
+import DiaryPage from './pages/DiaryPage';
+import CalendarPage from './pages/CalendarPage';
+import ChatPage from './pages/ChatPage';
+import Pomodoro from './components/Pomodoro';
+
 export default function App() {
   const [session, setSession] = useState(null);
   const navigate = useNavigate();
@@ -41,8 +46,13 @@ export default function App() {
           <Route path="/search" element={<SearchPage />} />
           <Route path="/fines" element={<MyFinesPage/>}/>
           <Route path="/day-profile" element={<DayProfilePage />} />
-          {/* <Route path="/today-others" element={<TodayOthersPage />} /> */}
           <Route path="/tasks" element={<TaskRegistryPage />} />
+          <Route path="/diary" element={<DiaryPage session={session} />} />
+<Route path="/calendar" element={<CalendarPage session={session} />} />
+<Route path="/chat" element={<ChatPage session={session} />} />\
+<Route path="/pomodoro" element={<Pomodoro />} />
+
+
           <Route path="/" element={<LoginPage />} />
         </Routes>
       </main>
