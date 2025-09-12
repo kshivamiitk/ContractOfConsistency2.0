@@ -1,3 +1,4 @@
+// src/App.jsx
 import React, { useEffect, useState } from 'react';
 import { Routes, Route, useNavigate } from 'react-router-dom';
 import { supabase } from './supabaseClient';
@@ -14,10 +15,11 @@ import DiaryPage from './pages/DiaryPage';
 import CalendarPage from './pages/CalendarPage';
 import ChatPage from './pages/ChatPage';
 import Pomodoro from './components/Pomodoro';
-import ConsistencyGraphGlobal from './components/ConsistencyGraph';
+import UnreadMessagesPopup from './components/UnreadMessagesPopup';
 
 export default function App() {
   const [session, setSession] = useState(null);
+  const [unreadCount, setUnreadCount] = useState(0);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -36,9 +38,15 @@ export default function App() {
     };
   }, []);
 
+  // handler passed into ChatPage so it can notify App about unread total
+  const handleUnreadChange = (totalUnread) => {
+    setUnreadCount(Number(totalUnread || 0));
+  };
+
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif' }}>
-      <Navbar session={session} />
+      <Navbar session={session} unreadCount={unreadCount} />
+      {session && <UnreadMessagesPopup session={session} />}
       <main style={{ padding: 20 }}>
         <Routes>
           <Route path="/login" element={<LoginPage />} />
@@ -49,10 +57,10 @@ export default function App() {
           <Route path="/day-profile" element={<DayProfilePage />} />
           <Route path="/tasks" element={<TaskRegistryPage />} />
           <Route path="/diary" element={<DiaryPage session={session} />} />
-<Route path="/calendar" element={<CalendarPage session={session} />} />
-<Route path="/chat" element={<ChatPage session={session} />} />\
-<Route path="/pomodoro" element={<Pomodoro />} />
-<Route path="/consistency" element={<ConsistencyGraphGlobal />} />
+          <Route path="/calendar" element={<CalendarPage session={session} />} />
+          {/* pass the prop to ChatPage so it can call onUnreadChange(totalUnread) */}
+          <Route path="/chat" element={<ChatPage session={session} onUnreadChange={handleUnreadChange} />} />
+          <Route path="/pomodoro" element={<Pomodoro />} />
           <Route path="/" element={<LoginPage />} />
         </Routes>
       </main>
