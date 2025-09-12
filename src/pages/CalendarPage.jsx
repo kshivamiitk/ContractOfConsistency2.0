@@ -3,35 +3,40 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import { supabase } from '../supabaseClient';
-
 dayjs.extend(utc);
 
-function fmtTime(ts) {
-  return dayjs(ts).format('HH:mm');
-}
+/*
+  Google-like calendar with:
+  - Day / Week view
+  - Hover tooltip (title/time/description)
+  - Click opens modal to edit/create
+  - Drag to move events
+  - Drag handle to resize events
+  - Persists updates to Supabase
+*/
 
-/**
- * Given events for a single day (start_ts/end_ts inside same day),
- * compute column index/columns count for overlap layout.
- */
+/* Helpers */
+function fmtTime(ts) { return dayjs(ts).format('HH:mm'); }
+const MIN_SNAP_MINUTES = 15; // snap drag/resize to 15 minutes
+const PIXELS_PER_MIN = 1;    // we use 1px == 1 minute (24h = 1440px) — consistent with hour-row=60px
+const TIMELINE_HEIGHT_PX = 24 * 60 * PIXELS_PER_MIN; // 1440
+
+// layout overlapping events into columns — keep reference to original DB event
 function layoutDayEvents(events) {
-  // events: [{id, start_ts, end_ts, ...}] with start/end as ISO strings
-  // Convert to numeric
-  const evs = events.map(ev => ({
-    ...ev,
-    s: +dayjs(ev.start_ts),
-    e: +dayjs(ev.end_ts),
-  })).sort((a, b) => a.s - b.s || a.e - b.e);
+  const evs = events.map(orig => ({
+    orig,
+    s: +dayjs(orig.start_ts),
+    e: +dayjs(orig.end_ts),
+    id: orig.id
+  })).sort((a,b) => a.s - b.s || a.e - b.e);
 
-  const columns = []; // array of arrays of events per column
-
+  const cols = [];
   evs.forEach(ev => {
-    // try place in an existing column
     let placed = false;
-    for (let i = 0; i < columns.length; i++) {
-      const col = columns[i];
+    for (let i=0;i<cols.length;i++) {
+      const col = cols[i];
       const last = col[col.length - 1];
-      if (ev.s >= last.e) { // no overlap with last event in this column
+      if (ev.s >= last.e) {
         col.push(ev);
         ev._col = i;
         placed = true;
@@ -39,48 +44,61 @@ function layoutDayEvents(events) {
       }
     }
     if (!placed) {
-      ev._col = columns.length;
-      columns.push([ev]);
+      ev._col = cols.length;
+      cols.push([ev]);
     }
   });
-
-  const totalCols = columns.length || 1;
-  return {
-    events: evs.map(ev => ({ ...ev, col: ev._col ?? 0, cols: totalCols })),
-    columnsCount: totalCols,
-  };
+  const total = Math.max(1, cols.length);
+  return { events: evs.map(ev => ({ id: ev.id, s: ev.s, e: ev.e, col: ev._col ?? 0, cols: total, orig: ev.orig })), columnsCount: total };
 }
 
+/* Component */
 export default function CalendarPage({ session }) {
   const userId = session?.user?.id;
-  const [anchorDate, setAnchorDate] = useState(dayjs().startOf('day')); // base date for view
-  const [view, setView] = useState('week'); // 'day' or 'week'
+  const [anchorDate, setAnchorDate] = useState(dayjs().startOf('day'));
+  const [view, setView] = useState('week'); // 'day' | 'week'
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(false);
 
-  // Add / edit form state
+  // edit modal state
   const [modalOpen, setModalOpen] = useState(false);
-  const [editing, setEditing] = useState(null); // null for new, or event object for edit
+  const [editing, setEditing] = useState(null); // original DB event or null for new
   const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
   const [startTime, setStartTime] = useState('09:00');
   const [endTime, setEndTime] = useState('10:00');
   const [allDay, setAllDay] = useState(false);
-  const descRef = useRef('');
+  const [saving, setSaving] = useState(false);
 
-  // derive visible range
+  // tooltip
+  const [tooltip, setTooltip] = useState(null); // {x,y,title,time,desc}
+  const containerRef = useRef(null);
+
+  // drag/resize state
+  const dragState = useRef(null); // { mode: 'move'|'resize', eventId, origStartMs, origEndMs, startClientY, dayKey }
+
+  // responsiveness
+  const [isNarrow, setIsNarrow] = useState(typeof window !== 'undefined' ? window.innerWidth < 900 : false);
+  useEffect(() => {
+    const onResize = () => setIsNarrow(window.innerWidth < 900);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // visible range
   const range = useMemo(() => {
     if (view === 'day') {
       const start = anchorDate.startOf('day');
       const end = anchorDate.endOf('day');
       return { start, end, days: [start] };
     }
-    // week view: 7 days from startOf('week')
     const start = anchorDate.startOf('week');
-    const days = Array.from({ length: 7 }, (_, i) => start.add(i, 'day'));
-    const end = days[days.length - 1].endOf('day');
+    const days = Array.from({length:7}, (_,i) => start.add(i,'day'));
+    const end = days[days.length-1].endOf('day');
     return { start, end, days };
   }, [anchorDate, view]);
 
+  // load events
   useEffect(() => {
     if (!userId) return;
     fetchEvents();
@@ -91,92 +109,74 @@ export default function CalendarPage({ session }) {
     setLoading(true);
     const dayStart = range.start.toISOString();
     const dayEnd = range.end.toISOString();
-    const { data, error } = await supabase
-      .from('events')
-      .select('*')
-      .eq('user_id', userId)
-      .gte('start_ts', dayStart)
-      .lte('start_ts', dayEnd)
-      .order('start_ts', { ascending: true });
+    try {
+      const { data, error } = await supabase
+        .from('events')
+        .select('*')
+        .eq('user_id', userId)
+        .gte('start_ts', dayStart)
+        .lte('start_ts', dayEnd)
+        .order('start_ts', { ascending: true });
 
-    if (error) {
-      console.error('fetch events', error);
+      if (error) {
+        console.error('fetch events', error);
+        setEvents([]);
+      } else setEvents(data || []);
+    } catch (err) {
+      console.error(err);
       setEvents([]);
-    } else {
-      setEvents(data || []);
-    }
-    setLoading(false);
+    } finally { setLoading(false); }
   }
 
+  // create new modal
   function openNewModal(forDate) {
     setEditing(null);
     setTitle('');
+    setDescription('');
     setAllDay(false);
-    const s = forDate ? dayjs(forDate) : anchorDate.hour(9);
-    const e = s.add(1, 'hour');
-    setStartTime(s.format('HH:mm'));
-    setEndTime(e.format('HH:mm'));
-    descRef.current = '';
+    const base = forDate ? dayjs(forDate) : anchorDate.hour(9);
+    setStartTime(base.format('HH:mm'));
+    setEndTime(base.add(1,'hour').format('HH:mm'));
     setModalOpen(true);
   }
 
+  // open edit (pass original DB event)
   function openEditModal(ev) {
     setEditing(ev);
     setTitle(ev.title || '');
+    setDescription(ev.description || '');
     setAllDay(Boolean(ev.all_day));
     setStartTime(dayjs(ev.start_ts).format('HH:mm'));
     setEndTime(dayjs(ev.end_ts).format('HH:mm'));
-    descRef.current = ev.description || '';
     setModalOpen(true);
   }
 
+  // save (insert or update)
   async function saveEvent(e) {
-    e.preventDefault();
-    if (!title) return alert('Title required');
-
-    // Build start/end ISO using the selected day for new event (editing keeps same day)
+    e?.preventDefault();
+    if (!title.trim()) return alert('Title required');
+    setSaving(true);
     const baseDate = editing ? dayjs(editing.start_ts).format('YYYY-MM-DD') : anchorDate.format('YYYY-MM-DD');
     const startIso = allDay ? dayjs(baseDate).startOf('day').toISOString() : dayjs(`${baseDate}T${startTime}`).toISOString();
     const endIso = allDay ? dayjs(baseDate).endOf('day').toISOString() : dayjs(`${baseDate}T${endTime}`).toISOString();
-
-    if (!allDay && dayjs(endIso).isBefore(dayjs(startIso))) {
-      return alert('End time must be after start time');
-    }
-
-    setLoading(true);
-    if (editing) {
-      const { error } = await supabase
-        .from('events')
-        .update({
-          title,
-          description: descRef.current,
-          start_ts: startIso,
-          end_ts: endIso,
-          all_day: allDay,
-        })
-        .eq('id', editing.id);
-      if (error) alert(error.message);
-      else {
-        setModalOpen(false);
-        fetchEvents();
+    if (!allDay && dayjs(endIso).isBefore(dayjs(startIso))) { setSaving(false); return alert('End must be after start'); }
+    try {
+      if (editing) {
+        const { error } = await supabase.from('events').update({
+          title, description, start_ts: startIso, end_ts: endIso, all_day: allDay
+        }).eq('id', editing.id);
+        if (error) throw error;
+      } else {
+        const payload = { user_id: userId, title, description, start_ts: startIso, end_ts: endIso, all_day: allDay };
+        const { error } = await supabase.from('events').insert(payload);
+        if (error) throw error;
       }
-    } else {
-      const payload = {
-        user_id: userId,
-        title,
-        description: descRef.current,
-        start_ts: startIso,
-        end_ts: endIso,
-        all_day: allDay,
-      };
-      const { error } = await supabase.from('events').insert(payload);
-      if (error) alert(error.message);
-      else {
-        setModalOpen(false);
-        fetchEvents();
-      }
-    }
-    setLoading(false);
+      setModalOpen(false);
+      await fetchEvents();
+    } catch (err) {
+      console.error('save', err);
+      alert(err.message || String(err));
+    } finally { setSaving(false); }
   }
 
   async function deleteEvent(id) {
@@ -186,7 +186,7 @@ export default function CalendarPage({ session }) {
     else fetchEvents();
   }
 
-  // group events by day (YYYY-MM-DD)
+  // group events by day key
   const eventsByDay = useMemo(() => {
     const map = {};
     for (const ev of events) {
@@ -197,179 +197,330 @@ export default function CalendarPage({ session }) {
     return map;
   }, [events]);
 
-  // Render helpers for hourly grid
-  const hours = Array.from({ length: 24 }, (_, i) => i);
+  const hours = Array.from({length:24}, (_,i) => i);
 
-  if (!userId) {
-    return <div style={{ padding: 20, background: '#fff', borderRadius: 6 }}>Please login to use the calendar.</div>;
+  if (!userId) return <div style={{padding:20, background:'#fff', borderRadius:6}}>Please login to use the calendar.</div>;
+
+  /* Tooltip helpers (show + move + hide) */
+  function showTooltip(e, ev) {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = Math.min(Math.max(8, e.clientX - rect.left + 12), rect.width - 320);
+    const y = Math.max(8, e.clientY - rect.top + 8);
+    setTooltip({ x, y, title: ev.title, desc: ev.description, time: ev.all_day ? 'All day' : `${fmtTime(ev.start_ts)} — ${fmtTime(ev.end_ts)}` });
+  }
+  function moveTooltip(e) {
+    if (!tooltip || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = Math.min(Math.max(8, e.clientX - rect.left + 12), rect.width - 320);
+    const y = Math.max(8, e.clientY - rect.top + 8);
+    setTooltip(t => ({ ...t, x, y }));
+  }
+  function hideTooltip() { setTooltip(null); }
+
+  /* Drag & resize logic:
+     - eventCard pointerdown -> initiate move
+     - resize handle pointerdown -> initiate resize
+     - pointermove -> update preview position in-place
+     - pointerup -> commit update to Supabase (update start_ts/end_ts)
+  */
+  function startMove(e, l) {
+    // l is layout item: { id, s, e, col, cols, orig }
+    // only support moving timed events (not all-day)
+    if (l.orig.all_day) return;
+    e.preventDefault();
+    const startClientY = e.clientY;
+    dragState.current = {
+      mode: 'move',
+      eventId: l.id,
+      dayKey: dayjs(l.orig.start_ts).format('YYYY-MM-DD'),
+      origStartMs: l.s,
+      origEndMs: l.e,
+      startClientY
+    };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    document.body.style.userSelect = 'none';
   }
 
-  return (
-    <div style={{ background: '#fff', padding: 16, borderRadius: 8 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>{view === 'week' ? 'Week Calendar' : 'Daily Calendar'}</h2>
+  function startResize(e, l) {
+    if (l.orig.all_day) return;
+    e.preventDefault();
+    const startClientY = e.clientY;
+    dragState.current = {
+      mode: 'resize',
+      eventId: l.id,
+      dayKey: dayjs(l.orig.start_ts).format('YYYY-MM-DD'),
+      origStartMs: l.s,
+      origEndMs: l.e,
+      startClientY
+    };
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    document.body.style.userSelect = 'none';
+  }
 
-        <div style={{ display: 'flex', gap: 8, marginLeft: 12 }}>
-          <button onClick={() => setView('day')} style={{ padding: '6px 10px', borderRadius: 6, border: view === 'day' ? '2px solid #333' : '1px solid #ddd' }}>Day</button>
-          <button onClick={() => setView('week')} style={{ padding: '6px 10px', borderRadius: 6, border: view === 'week' ? '2px solid #333' : '1px solid #ddd' }}>Week</button>
+  function onPointerMove(ev) {
+    const st = dragState.current;
+    if (!st) return;
+    const deltaY = ev.clientY - st.startClientY;
+    // delta minutes = deltaY / PIXELS_PER_MIN
+    const deltaMinutes = Math.round(deltaY / PIXELS_PER_MIN);
+    // snap to nearest MIN_SNAP_MINUTES
+    const snap = Math.round(deltaMinutes / MIN_SNAP_MINUTES) * MIN_SNAP_MINUTES;
+    if (st.mode === 'move') {
+      const newStartMs = st.origStartMs + snap * 60000;
+      const newEndMs = st.origEndMs + snap * 60000;
+      // show preview by mutating in-memory events state (not persisted yet)
+      setEvents(prev => prev.map(evRow => evRow.id === st.eventId ? { ...evRow, __previewStart: newStartMs, __previewEnd: newEndMs } : evRow));
+    } else if (st.mode === 'resize') {
+      const newEndMs = st.origEndMs + snap * 60000;
+      // ensure minimum duration 15 minutes
+      const minEnd = st.origStartMs + MIN_SNAP_MINUTES * 60000;
+      const finalEndMs = Math.max(minEnd, newEndMs);
+      setEvents(prev => prev.map(evRow => evRow.id === st.eventId ? { ...evRow, __previewEnd: finalEndMs } : evRow));
+    }
+  }
+
+  async function onPointerUp(ev) {
+    const st = dragState.current;
+    if (!st) return;
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', onPointerUp);
+    document.body.style.userSelect = '';
+
+    // read preview values
+    const previewEv = events.find(x => x.id === st.eventId);
+    if (!previewEv) { dragState.current = null; return; }
+
+    const newStartMs = previewEv.__previewStart != null ? previewEv.__previewStart : +dayjs(previewEv.start_ts);
+    const newEndMs = previewEv.__previewEnd != null ? previewEv.__previewEnd : +dayjs(previewEv.end_ts);
+    // clear preview markers
+    setEvents(prev => prev.map(evRow => {
+      if (evRow.id === st.eventId) {
+        const copy = { ...evRow };
+        delete copy.__previewStart;
+        delete copy.__previewEnd;
+        return copy;
+      }
+      return evRow;
+    }));
+
+    // Only update if times changed
+    const origStart = +dayjs(previewEv.start_ts);
+    const origEnd = +dayjs(previewEv.end_ts);
+    if (newStartMs !== origStart || newEndMs !== origEnd) {
+      try {
+        setLoading(true);
+        const startIso = dayjs(newStartMs).toISOString();
+        const endIso = dayjs(newEndMs).toISOString();
+        const { error } = await supabase.from('events').update({ start_ts: startIso, end_ts: endIso }).eq('id', st.eventId);
+        if (error) throw error;
+        await fetchEvents();
+      } catch (err) {
+        console.error('drag update error', err);
+        alert('Could not update event: ' + (err.message || String(err)));
+        await fetchEvents();
+      } finally { setLoading(false); }
+    }
+    dragState.current = null;
+  }
+
+  // Render one day's column (header, all-day, timeline, quick list)
+  function renderDayColumn(day) {
+    const dayKey = day.format('YYYY-MM-DD');
+    const dayEvents = eventsByDay[dayKey] || [];
+    const allDayEvents = dayEvents.filter(e => e.all_day);
+    const timedEvents = dayEvents.filter(e => !e.all_day);
+    const { events: laidEvents } = layoutDayEvents(timedEvents);
+    const dayStartMs = +day.startOf('day');
+
+    return (
+      <div key={dayKey} style={styles.column}>
+        <div style={styles.dayHeader}>
+          <div>
+            <div style={{fontWeight:700}}>{day.format('ddd')}</div>
+            <div style={{fontSize:12,color:'#666'}}>{day.format('MMM D')}</div>
+          </div>
+          <div>
+            <button onClick={() => openNewModal(day.format('YYYY-MM-DD'))} style={styles.slotButton}>+ slot</button>
+          </div>
         </div>
 
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button onClick={() => setAnchorDate(anchorDate.subtract(view === 'day' ? 1 : 7, 'day'))}>◀</button>
-          <button onClick={() => setAnchorDate(dayjs())}>Today</button>
-          <button onClick={() => setAnchorDate(anchorDate.add(view === 'day' ? 1 : 7, 'day'))}>▶</button>
-          <button onClick={() => openNewModal(null)} style={{ padding: '6px 10px', borderRadius: 6 }}>+ New</button>
+        {/* all-day */}
+        <div style={styles.allDayRow}>
+          {allDayEvents.length === 0 ? <div style={{color:'#999',fontSize:12}}>No all-day</div> :
+            allDayEvents.map(ev => (
+              <div key={ev.id}
+                   role="button" tabIndex={0}
+                   onClick={() => openEditModal(ev)}
+                   onKeyDown={e => { if (e.key === 'Enter') openEditModal(ev); }}
+                   onMouseEnter={e => showTooltip(e, ev)}
+                   onMouseMove={moveTooltip}
+                   onMouseLeave={hideTooltip}
+                   style={styles.allDayChip}
+              >
+                <div style={{fontWeight:700}}>{ev.title}</div>
+              </div>
+            ))
+          }
         </div>
-      </div>
 
-      <div style={{ display: 'flex', gap: 12 }}>
-        {/* left hours column (only show once) */}
-        <div style={{ width: 70, flexShrink: 0 }}>
-          <div style={{ height: 40, borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12 }}>All day</div>
-          {hours.map(h => (
-            <div key={h} style={{ height: 60, borderBottom: '1px solid #f3f3f3', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, color: '#666' }}>
-              {String(h).padStart(2, '0')}:00
-            </div>
-          ))}
-        </div>
-
-        {/* main grid: one column per day */}
-        <div style={{ flex: 1, display: 'flex', gap: 8, overflowX: 'auto' }}>
-          {range.days.map(day => {
-            const dayKey = day.format('YYYY-MM-DD');
-            const dayEvents = eventsByDay[dayKey] || [];
-            const allDayEvents = dayEvents.filter(e => e.all_day);
-            const timedEvents = dayEvents.filter(e => !e.all_day);
-            const { events: laidEvents } = layoutDayEvents(timedEvents);
+        {/* timeline (absolute positioned events) */}
+        <div style={{...styles.timelineContainer, height: TIMELINE_HEIGHT_PX}}>
+          {laidEvents.map(l => {
+            const evOrig = l.orig;
+            const startMs = evOrig.__previewStart ?? +dayjs(evOrig.start_ts) ?? l.s;
+            const endMs = evOrig.__previewEnd ?? +dayjs(evOrig.end_ts) ?? l.e;
+            const minutesFromStart = Math.max(0, Math.round((startMs - dayStartMs) / 60000));
+            const minutesLength = Math.max(15, Math.round((endMs - startMs) / 60000));
+            const topPx = minutesFromStart * PIXELS_PER_MIN;
+            const heightPx = minutesLength * PIXELS_PER_MIN;
+            const widthPercent = 100 / l.cols;
+            const leftPercent = l.col * widthPercent;
 
             return (
-              <div key={dayKey} style={{ minWidth: 220, borderLeft: '1px solid #f0f0f0', borderRight: '1px solid #f0f0f0', borderRadius: 6, background: '#fafafa', padding: 6, boxSizing: 'border-box' }}>
-                <div style={{ height: 40, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 6px' }}>
-                  <div>
-                    <div style={{ fontWeight: '600' }}>{day.format('ddd')}</div>
-                    <div style={{ fontSize: 12, color: '#666' }}>{day.format('MMM D')}</div>
-                  </div>
-                  <div>
-                    <button onClick={() => openNewModal(day.format('YYYY-MM-DD'))} style={{ fontSize: 12 }}>+ slot</button>
-                  </div>
+              <div key={l.id}
+                   role="button" tabIndex={0}
+                   onClick={() => openEditModal(evOrig)}
+                   onKeyDown={e => { if (e.key === 'Enter') openEditModal(evOrig); }}
+                   onMouseEnter={e => showTooltip(e, evOrig)}
+                   onMouseMove={moveTooltip}
+                   onMouseLeave={hideTooltip}
+                   style={{
+                     ...styles.eventCard,
+                     top: topPx,
+                     left: `calc(${leftPercent}% + 6px)`,
+                     width: `calc(${widthPercent}% - 12px)`,
+                     height: heightPx,
+                   }}
+                   onPointerDown={(e) => startMove(e, l)}
+              >
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                  <div style={{fontWeight:700,fontSize:12,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{evOrig.title}</div>
+                  {/* resize handle */}
+                  <div style={{width:8, height:8, borderRadius:4, background:'#0008', cursor:'ns-resize'}} 
+                       onPointerDown={(ev) => { ev.stopPropagation(); startResize(ev, l); }} />
                 </div>
-
-                {/* all-day row */}
-                <div style={{ minHeight: 40, borderBottom: '1px solid #eee', marginBottom: 6, padding: 6, display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                  {allDayEvents.length === 0 ? <div style={{ color: '#999', fontSize: 12 }}>No all-day</div> : allDayEvents.map(ev => (
-                    <div key={ev.id} style={{ padding: '6px 8px', background: '#e9f5ff', borderRadius: 6, fontSize: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-                      <div style={{ fontWeight: 600 }}>{ev.title}</div>
-                      <div style={{ fontSize: 11, color: '#555' }}>
-                        <button onClick={() => openEditModal(ev)} style={{ marginLeft: 6, fontSize: 11 }}>Edit</button>
-                        <button onClick={() => deleteEvent(ev.id)} style={{ marginLeft: 4, fontSize: 11 }}>Del</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* timeline container */}
-                <div style={{ position: 'relative', height: 24 * 60 / 15 * 15, /* ~1440px scaled down by 1 */ overflow: 'hidden' }}>
-                  {/* absolute-positioned events */}
-                  {laidEvents.map(ev => {
-                    // compute top and height as percentage of day (0-24h)
-                    const dayStartMs = +day.startOf('day');
-                    const minutesFromStart = (ev.s - dayStartMs) / 60000;
-                    const minutesLength = Math.max(15, (ev.e - ev.s) / 60000); // min height
-                    const top = (minutesFromStart / (24 * 60)) * 100;
-                    const height = (minutesLength / (24 * 60)) * 100;
-                    const widthPercent = 100 / ev.cols;
-                    const leftPercent = ev.col * widthPercent;
-
-                    return (
-                      <div
-                        key={ev.id}
-                        onClick={() => openEditModal(ev)}
-                        style={{
-                          position: 'absolute',
-                          top: `${top}%`,
-                          left: `${leftPercent}%`,
-                          width: `calc(${widthPercent}% - 6px)`,
-                          height: `${height}%`,
-                          padding: 6,
-                          boxSizing: 'border-box',
-                          background: '#dbefff',
-                          border: '1px solid #c2ddff',
-                          borderRadius: 6,
-                          overflow: 'hidden',
-                          cursor: 'pointer',
-                        }}
-                        title={`${ev.title} — ${fmtTime(ev.start_ts)}-${fmtTime(ev.end_ts)}`}
-                      >
-                        <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{ev.title}</div>
-                        <div style={{ fontSize: 11, color: '#333' }}>{fmtTime(ev.start_ts)} — {fmtTime(ev.end_ts)}</div>
-                      </div>
-                    );
-                  })}
-
-                  {/* invisible hour separators to keep height consistent */}
-                  <div style={{ position: 'absolute', inset: 0 }}>
-                    {hours.map((h, idx) => (
-                      <div key={h} style={{ height: '60px', borderBottom: '1px dashed rgba(0,0,0,0.04)' }} />
-                    ))}
-                  </div>
-                </div>
-
-                {/* small list at bottom for quick view */}
-                <div style={{ marginTop: 8 }}>
-                  {timedEvents.length === 0 ? <div style={{ color: '#999', fontSize: 12 }}>No events</div> :
-                    timedEvents.map(ev => (
-                      <div key={ev.id} style={{ padding: 6, borderRadius: 6, border: '1px solid #eee', marginBottom: 6, background: '#fff' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <div style={{ fontWeight: 600 }}>{ev.title}</div>
-                          <div style={{ fontSize: 12, color: '#666' }}>{fmtTime(ev.start_ts)} — {fmtTime(ev.end_ts)}</div>
-                        </div>
-                      </div>
-                    ))
-                  }
-                </div>
+                <div style={{fontSize:11, color:'#333'}}>{fmtTime(startMs)} — {fmtTime(endMs)}</div>
               </div>
             );
           })}
+
+          {/* invisible hour rows to maintain height */}
+          <div style={{position:'absolute', inset:0}}>
+            {hours.map(h => <div key={h} style={styles.hourRow} />)}
+          </div>
+        </div>
+
+        {/* quick list */}
+        <div style={{marginTop:8}}>
+          {timedEvents.length === 0 ? <div style={{color:'#999',fontSize:12}}>No events</div> :
+            timedEvents.map(ev => (
+              <div key={ev.id}
+                   role="button" tabIndex={0}
+                   onClick={() => openEditModal(ev)}
+                   onKeyDown={e => { if (e.key === 'Enter') openEditModal(ev); }}
+                   onMouseEnter={e => showTooltip(e, ev)}
+                   onMouseMove={moveTooltip}
+                   onMouseLeave={hideTooltip}
+                   style={styles.quickListItem}
+              >
+                <div style={{fontWeight:700}}>{ev.title}</div>
+                <div style={{fontSize:12, color:'#666'}}>{fmtTime(ev.start_ts)} — {fmtTime(ev.end_ts)}</div>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={containerRef} style={styles.container}>
+      {/* header */}
+      <div style={styles.header}>
+        <div style={{fontSize:20,fontWeight:700}}>{view === 'week' ? 'Week Calendar' : 'Day Calendar'}</div>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          <div style={{display:'flex',gap:6}}>
+            <button onClick={() => setView('day')} style={view==='day'?styles.primaryTab:styles.tab}>Day</button>
+            <button onClick={() => setView('week')} style={view==='week'?styles.primaryTab:styles.tab}>Week</button>
+          </div>
+          <div style={{display:'flex',gap:6,marginLeft:6}}>
+            <button onClick={() => setAnchorDate(anchorDate.subtract(view === 'day' ? 1 : 7, 'day'))} style={styles.iconBtn}>◀</button>
+            <button onClick={() => setAnchorDate(dayjs())} style={styles.btn}>Today</button>
+            <button onClick={() => setAnchorDate(anchorDate.add(view === 'day' ? 1 : 7, 'day'))} style={styles.iconBtn}>▶</button>
+          </div>
+          <button onClick={() => openNewModal(null)} style={styles.addBtn}>+ New</button>
         </div>
       </div>
 
-      {/* modal for add/edit */}
-      {modalOpen && (
+      {/* body */}
+      <div style={{display:'flex',gap:12}}>
+        <div style={styles.leftHours}>
+          <div style={styles.allDayLeftHeader}>All day</div>
+          {hours.map(h => <div key={h} style={styles.hourLabel}>{String(h).padStart(2,'0')}:00</div>)}
+        </div>
+
+        <div style={{flex:1, display:'flex', gap:8, overflowX:'auto', paddingBottom:20}}>
+          {range.days.map(d => renderDayColumn(d))}
+        </div>
+      </div>
+
+      {/* tooltip */}
+      {tooltip && (
         <div style={{
-          position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          background: 'rgba(0,0,0,0.35)', zIndex: 60
+          position:'absolute',
+          left: tooltip.x,
+          top: tooltip.y,
+          background:'#fff',
+          border:'1px solid rgba(0,0,0,0.08)',
+          padding:10,
+          borderRadius:8,
+          boxShadow:'0 6px 18px rgba(20,28,48,0.08)',
+          pointerEvents:'none',
+          zIndex:9999,
+          width:320
         }}>
-          <form onSubmit={saveEvent} style={{ background: '#fff', padding: 16, borderRadius: 8, width: 480, boxShadow: '0 6px 30px rgba(0,0,0,0.2)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3 style={{ margin: 0 }}>{editing ? 'Edit event' : 'New event'}</h3>
+          <div style={{fontWeight:700}}>{tooltip.title}</div>
+          <div style={{fontSize:12,color:'#666',marginTop:6}}>{tooltip.time}</div>
+          <div style={{marginTop:8,fontSize:13}}>{tooltip.desc || <span style={{color:'#999'}}>No description</span>}</div>
+        </div>
+      )}
+
+      {/* modal */}
+      {modalOpen && (
+        <div style={styles.modalBackdrop}>
+          <form onSubmit={saveEvent} style={styles.modal}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <h3 style={{margin:0}}>{editing ? 'Edit event' : 'New event'}</h3>
               <div>
-                {editing && <button type="button" onClick={() => { if (confirm('Delete event?')) deleteEvent(editing.id); }} style={{ marginRight: 8 }}>Delete</button>}
-                <button type="button" onClick={() => setModalOpen(false)}>Close</button>
+                {editing && <button type="button" onClick={() => { if (confirm('Delete event?')) deleteEvent(editing.id); }} style={styles.dangerBtn}>Delete</button>}
+                <button type="button" onClick={() => setModalOpen(false)} style={styles.btn}>Close</button>
               </div>
             </div>
 
-            <div style={{ marginTop: 12, display: 'flex', gap: 8, flexDirection: 'column' }}>
-              <input placeholder="Title" value={title} onChange={e => setTitle(e.target.value)} style={{ padding: 8, fontSize: 14 }} />
-
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                  <input type="checkbox" checked={allDay} onChange={e => setAllDay(e.target.checked)} />
-                  All day
-                </label>
-                {!allDay && (
-                  <>
-                    <label>Start <input type="time" value={startTime} onChange={e => setStartTime(e.target.value)} /></label>
-                    <label>End <input type="time" value={endTime} onChange={e => setEndTime(e.target.value)} /></label>
-                  </>
-                )}
-              </div>
-
-              <textarea placeholder="Description" defaultValue={editing?.description || ''} onChange={e => descRef.current = e.target.value} style={{ minHeight: 80, padding: 8 }} />
+            <div style={{marginTop:12,display:'flex',flexDirection:'column',gap:8}}>
+              <input value={title} onChange={e=>setTitle(e.target.value)} placeholder="Title" style={styles.input} autoFocus />
+              <label style={{display:'flex',gap:8,alignItems:'center'}}><input type="checkbox" checked={allDay} onChange={e=>setAllDay(e.target.checked)} /> All day</label>
+              {!allDay && (
+                <div style={{display:'flex',gap:8}}>
+                  <div style={{flex:1}}>
+                    <label style={{display:'block',marginBottom:4,fontSize:12}}>Start</label>
+                    <input type="time" value={startTime} onChange={e=>setStartTime(e.target.value)} style={styles.input} />
+                  </div>
+                  <div style={{flex:1}}>
+                    <label style={{display:'block',marginBottom:4,fontSize:12}}>End</label>
+                    <input type="time" value={endTime} onChange={e=>setEndTime(e.target.value)} style={styles.input} />
+                  </div>
+                </div>
+              )}
+              <textarea value={description} onChange={e=>setDescription(e.target.value)} placeholder="Description" style={{minHeight:100,padding:8,borderRadius:6}} />
             </div>
 
-            <div style={{ marginTop: 12, display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button type="button" onClick={() => setModalOpen(false)}>Cancel</button>
-              <button type="submit">{loading ? 'Saving…' : (editing ? 'Save' : 'Add')}</button>
+            <div style={{marginTop:12,display:'flex',gap:8,justifyContent:'flex-end'}}>
+              <button type="button" onClick={()=>setModalOpen(false)} style={styles.btn}>Cancel</button>
+              <button type="submit" style={styles.primary}>{saving ? 'Saving…' : (editing ? 'Save' : 'Add')}</button>
             </div>
           </form>
         </div>
@@ -377,3 +528,38 @@ export default function CalendarPage({ session }) {
     </div>
   );
 }
+
+/* Styles (clean / Google-like) */
+const styles = {
+  container: { background:'#fff', padding:18, borderRadius:10, fontFamily:`Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial`, color:'#111', position:'relative' },
+  header: { display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12 },
+  tab: { padding:'6px 10px', borderRadius:8, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer' },
+  primaryTab: { padding:'6px 10px', borderRadius:8, border:'1px solid #111', background:'#111', color:'#fff', cursor:'pointer' },
+  btn: { padding:'6px 10px', borderRadius:8, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer' },
+  iconBtn: { padding:'6px 8px', borderRadius:8, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer' },
+  addBtn: { padding:'8px 12px', borderRadius:8, border:'none', background:'#1a73e8', color:'#fff', cursor:'pointer' },
+  dangerBtn: { marginRight:8, padding:'6px 8px', borderRadius:8, border:'1px solid #e6b0b0', background:'#fff', color:'#b22' },
+
+  leftHours: { width:80, flexShrink:0 },
+  allDayLeftHeader: { height:40, borderBottom:'1px solid #eee', display:'flex',alignItems:'center',justifyContent:'center',fontSize:12, color:'#444' },
+  hourLabel: { height:60, borderBottom:'1px solid #f3f3f3', display:'flex',alignItems:'center',justifyContent:'center', color:'#666', fontSize:12 },
+
+  column: { minWidth:260, borderLeft:'1px solid #f0f0f0', borderRight:'1px solid #f0f0f0', borderRadius:6, background:'#fafafa', padding:8, boxSizing:'border-box' },
+  dayHeader: { height:56, display:'flex',alignItems:'center',justifyContent:'space-between', padding:'0 8px', borderBottom:'1px solid #eee' },
+  slotButton: { padding:'6px 8px', borderRadius:6, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer', fontSize:12 },
+
+  allDayRow: { minHeight:48, borderBottom:'1px solid #eee', marginBottom:6, display:'flex', gap:6, alignItems:'center', padding:6, flexWrap:'wrap' },
+  allDayChip: { padding:'6px 10px', background:'#fcefe6', borderRadius:8, fontSize:13, cursor:'pointer', border:'1px solid #f3d6c0' },
+
+  timelineContainer: { position:'relative', overflow:'hidden' }, // height set per column to big pixel value
+  hourRow: { height:'60px', borderBottom:'1px dashed rgba(0,0,0,0.04)' },
+
+  eventCard: { position:'absolute', padding:8, boxSizing:'border-box', borderRadius:8, overflow:'hidden', cursor:'pointer', background:'#e7f3ff', border:'1px solid #cfe6ff' },
+
+  quickListItem: { padding:8, borderRadius:8, border:'1px solid #eee', marginBottom:6, background:'#fff', cursor:'pointer' },
+
+  modalBackdrop: { position:'fixed', inset:0, display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,0.35)', zIndex:1000 },
+  modal: { background:'#fff', padding:18, borderRadius:10, width:520, boxShadow:'0 10px 40px rgba(2,6,23,0.2)' },
+  input: { padding:8, borderRadius:6, border:'1px solid #e6e6e6', width:'100%' },
+  primary: { padding:'8px 12px', borderRadius:8, border:'none', background:'#1a73e8', color:'#fff', cursor:'pointer' },
+};
