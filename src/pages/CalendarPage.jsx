@@ -6,22 +6,23 @@ import { supabase } from '../supabaseClient';
 dayjs.extend(utc);
 
 /*
-  Google-like calendar with:
+  Google-like calendar:
   - Day / Week view
   - Hover tooltip (title/time/description)
   - Click opens modal to edit/create
-  - Drag to move events
-  - Drag handle to resize events
+  - Drag to move events (starts only after small move threshold)
+  - Drag handle to resize events (same threshold)
   - Persists updates to Supabase
+  - Visual cues: selected day highlight, "creating for" badge, royal-blue theme
 */
 
 /* Helpers */
 function fmtTime(ts) { return dayjs(ts).format('HH:mm'); }
-const MIN_SNAP_MINUTES = 15; // snap drag/resize to 15 minutes
-const PIXELS_PER_MIN = 1;    // we use 1px == 1 minute (24h = 1440px) — consistent with hour-row=60px
-const TIMELINE_HEIGHT_PX = 24 * 60 * PIXELS_PER_MIN; // 1440
+const MIN_SNAP_MINUTES = 15;
+const PIXELS_PER_MIN = 1;
+const TIMELINE_HEIGHT_PX = 24 * 60 * PIXELS_PER_MIN;
+const DRAG_START_THRESHOLD_PX = 6;
 
-// layout overlapping events into columns — keep reference to original DB event
 function layoutDayEvents(events) {
   const evs = events.map(orig => ({
     orig,
@@ -52,7 +53,6 @@ function layoutDayEvents(events) {
   return { events: evs.map(ev => ({ id: ev.id, s: ev.s, e: ev.e, col: ev._col ?? 0, cols: total, orig: ev.orig })), columnsCount: total };
 }
 
-/* Component */
 export default function CalendarPage({ session }) {
   const userId = session?.user?.id;
   const [anchorDate, setAnchorDate] = useState(dayjs().startOf('day'));
@@ -60,9 +60,12 @@ export default function CalendarPage({ session }) {
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(false);
 
-  // edit modal state
+  // The single source-of-truth for "which day this new slot applies to"
+  const [selectedDate, setSelectedDate] = useState(anchorDate.startOf('day'));
+
+  // modal state
   const [modalOpen, setModalOpen] = useState(false);
-  const [editing, setEditing] = useState(null); // original DB event or null for new
+  const [editing, setEditing] = useState(null);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [startTime, setStartTime] = useState('09:00');
@@ -70,14 +73,11 @@ export default function CalendarPage({ session }) {
   const [allDay, setAllDay] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // tooltip
-  const [tooltip, setTooltip] = useState(null); // {x,y,title,time,desc}
+  const [tooltip, setTooltip] = useState(null);
   const containerRef = useRef(null);
 
-  // drag/resize state
-  const dragState = useRef(null); // { mode: 'move'|'resize', eventId, origStartMs, origEndMs, startClientY, dayKey }
+  const dragState = useRef(null);
 
-  // responsiveness
   const [isNarrow, setIsNarrow] = useState(typeof window !== 'undefined' ? window.innerWidth < 900 : false);
   useEffect(() => {
     const onResize = () => setIsNarrow(window.innerWidth < 900);
@@ -85,7 +85,6 @@ export default function CalendarPage({ session }) {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // visible range
   const range = useMemo(() => {
     if (view === 'day') {
       const start = anchorDate.startOf('day');
@@ -98,7 +97,8 @@ export default function CalendarPage({ session }) {
     return { start, end, days };
   }, [anchorDate, view]);
 
-  // load events
+  useEffect(() => { setSelectedDate(anchorDate.startOf('day')); }, [anchorDate]);
+
   useEffect(() => {
     if (!userId) return;
     fetchEvents();
@@ -128,19 +128,23 @@ export default function CalendarPage({ session }) {
     } finally { setLoading(false); }
   }
 
-  // create new modal
+  // OPEN NEW modal for a day — forDate can be dayjs or 'YYYY-MM-DD' string
   function openNewModal(forDate) {
     setEditing(null);
     setTitle('');
     setDescription('');
     setAllDay(false);
-    const base = forDate ? dayjs(forDate) : anchorDate.hour(9);
+
+    const dateObj = forDate ? dayjs(forDate) : anchorDate;
+    setSelectedDate(dateObj.startOf('day'));
+
+    // set sensible default times relative to that day
+    const base = dateObj.startOf('day').hour(9);
     setStartTime(base.format('HH:mm'));
     setEndTime(base.add(1,'hour').format('HH:mm'));
     setModalOpen(true);
   }
 
-  // open edit (pass original DB event)
   function openEditModal(ev) {
     setEditing(ev);
     setTitle(ev.title || '');
@@ -148,18 +152,22 @@ export default function CalendarPage({ session }) {
     setAllDay(Boolean(ev.all_day));
     setStartTime(dayjs(ev.start_ts).format('HH:mm'));
     setEndTime(dayjs(ev.end_ts).format('HH:mm'));
+    // ensure selectedDate shows the day of the event (for clarity)
+    setSelectedDate(dayjs(ev.start_ts).startOf('day'));
     setModalOpen(true);
   }
 
-  // save (insert or update)
   async function saveEvent(e) {
     e?.preventDefault();
     if (!title.trim()) return alert('Title required');
     setSaving(true);
-    const baseDate = editing ? dayjs(editing.start_ts).format('YYYY-MM-DD') : anchorDate.format('YYYY-MM-DD');
+
+    // use selectedDate to decide which day this new slot belongs to
+    const baseDate = editing ? dayjs(editing.start_ts).format('YYYY-MM-DD') : dayjs(selectedDate).format('YYYY-MM-DD');
     const startIso = allDay ? dayjs(baseDate).startOf('day').toISOString() : dayjs(`${baseDate}T${startTime}`).toISOString();
     const endIso = allDay ? dayjs(baseDate).endOf('day').toISOString() : dayjs(`${baseDate}T${endTime}`).toISOString();
     if (!allDay && dayjs(endIso).isBefore(dayjs(startIso))) { setSaving(false); return alert('End must be after start'); }
+
     try {
       if (editing) {
         const { error } = await supabase.from('events').update({
@@ -179,14 +187,29 @@ export default function CalendarPage({ session }) {
     } finally { setSaving(false); }
   }
 
+  // robust delete: use select() to surface errors and close modal on success
   async function deleteEvent(id) {
     if (!confirm('Delete event?')) return;
-    const { error } = await supabase.from('events').delete().eq('id', id);
-    if (error) alert(error.message);
-    else fetchEvents();
+    try {
+      setLoading(true);
+      // call delete and select the deleted row to force supabase to return errors if any
+      const { data, error } = await supabase.from('events').delete().eq('id', id).select().single();
+      if (error) {
+        console.error('delete error', error);
+        alert('Delete failed: ' + (error.message || String(error)));
+      } else {
+        // close modal if open and refresh
+        if (modalOpen) setModalOpen(false);
+        await fetchEvents();
+      }
+    } catch (err) {
+      console.error('delete unexpected', err);
+      alert('Delete failed: ' + (err.message || String(err)));
+    } finally {
+      setLoading(false);
+    }
   }
 
-  // group events by day key
   const eventsByDay = useMemo(() => {
     const map = {};
     for (const ev of events) {
@@ -201,7 +224,6 @@ export default function CalendarPage({ session }) {
 
   if (!userId) return <div style={{padding:20, background:'#fff', borderRadius:6}}>Please login to use the calendar.</div>;
 
-  /* Tooltip helpers (show + move + hide) */
   function showTooltip(e, ev) {
     if (!containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
@@ -218,25 +240,17 @@ export default function CalendarPage({ session }) {
   }
   function hideTooltip() { setTooltip(null); }
 
-  /* Drag & resize logic:
-     - eventCard pointerdown -> initiate move
-     - resize handle pointerdown -> initiate resize
-     - pointermove -> update preview position in-place
-     - pointerup -> commit update to Supabase (update start_ts/end_ts)
-  */
+  /* Drag & resize (same as before) */
   function startMove(e, l) {
-    // l is layout item: { id, s, e, col, cols, orig }
-    // only support moving timed events (not all-day)
     if (l.orig.all_day) return;
-    e.preventDefault();
-    const startClientY = e.clientY;
     dragState.current = {
       mode: 'move',
       eventId: l.id,
       dayKey: dayjs(l.orig.start_ts).format('YYYY-MM-DD'),
       origStartMs: l.s,
       origEndMs: l.e,
-      startClientY
+      startClientY: e.clientY,
+      moved: false
     };
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
@@ -245,15 +259,14 @@ export default function CalendarPage({ session }) {
 
   function startResize(e, l) {
     if (l.orig.all_day) return;
-    e.preventDefault();
-    const startClientY = e.clientY;
     dragState.current = {
       mode: 'resize',
       eventId: l.id,
       dayKey: dayjs(l.orig.start_ts).format('YYYY-MM-DD'),
       origStartMs: l.s,
       origEndMs: l.e,
-      startClientY
+      startClientY: e.clientY,
+      moved: false
     };
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
@@ -264,18 +277,19 @@ export default function CalendarPage({ session }) {
     const st = dragState.current;
     if (!st) return;
     const deltaY = ev.clientY - st.startClientY;
-    // delta minutes = deltaY / PIXELS_PER_MIN
+    if (!st.moved) {
+      if (Math.abs(deltaY) < DRAG_START_THRESHOLD_PX) return;
+      st.moved = true;
+    }
     const deltaMinutes = Math.round(deltaY / PIXELS_PER_MIN);
-    // snap to nearest MIN_SNAP_MINUTES
     const snap = Math.round(deltaMinutes / MIN_SNAP_MINUTES) * MIN_SNAP_MINUTES;
+
     if (st.mode === 'move') {
       const newStartMs = st.origStartMs + snap * 60000;
       const newEndMs = st.origEndMs + snap * 60000;
-      // show preview by mutating in-memory events state (not persisted yet)
       setEvents(prev => prev.map(evRow => evRow.id === st.eventId ? { ...evRow, __previewStart: newStartMs, __previewEnd: newEndMs } : evRow));
     } else if (st.mode === 'resize') {
       const newEndMs = st.origEndMs + snap * 60000;
-      // ensure minimum duration 15 minutes
       const minEnd = st.origStartMs + MIN_SNAP_MINUTES * 60000;
       const finalEndMs = Math.max(minEnd, newEndMs);
       setEvents(prev => prev.map(evRow => evRow.id === st.eventId ? { ...evRow, __previewEnd: finalEndMs } : evRow));
@@ -289,13 +303,18 @@ export default function CalendarPage({ session }) {
     window.removeEventListener('pointerup', onPointerUp);
     document.body.style.userSelect = '';
 
-    // read preview values
     const previewEv = events.find(x => x.id === st.eventId);
     if (!previewEv) { dragState.current = null; return; }
 
+    if (!st.moved) {
+      dragState.current = null;
+      openEditModal(previewEv);
+      return;
+    }
+
     const newStartMs = previewEv.__previewStart != null ? previewEv.__previewStart : +dayjs(previewEv.start_ts);
     const newEndMs = previewEv.__previewEnd != null ? previewEv.__previewEnd : +dayjs(previewEv.end_ts);
-    // clear preview markers
+
     setEvents(prev => prev.map(evRow => {
       if (evRow.id === st.eventId) {
         const copy = { ...evRow };
@@ -306,7 +325,6 @@ export default function CalendarPage({ session }) {
       return evRow;
     }));
 
-    // Only update if times changed
     const origStart = +dayjs(previewEv.start_ts);
     const origEnd = +dayjs(previewEv.end_ts);
     if (newStartMs !== origStart || newEndMs !== origEnd) {
@@ -323,10 +341,10 @@ export default function CalendarPage({ session }) {
         await fetchEvents();
       } finally { setLoading(false); }
     }
+
     dragState.current = null;
   }
 
-  // Render one day's column (header, all-day, timeline, quick list)
   function renderDayColumn(day) {
     const dayKey = day.format('YYYY-MM-DD');
     const dayEvents = eventsByDay[dayKey] || [];
@@ -335,19 +353,24 @@ export default function CalendarPage({ session }) {
     const { events: laidEvents } = layoutDayEvents(timedEvents);
     const dayStartMs = +day.startOf('day');
 
+    // highlight if this is the selectedDate for creating or editing
+    const isSelectedDay = selectedDate && dayjs(selectedDate).format('YYYY-MM-DD') === dayKey;
+
     return (
-      <div key={dayKey} style={styles.column}>
-        <div style={styles.dayHeader}>
+      <div key={dayKey} style={{ ...styles.column, boxShadow: isSelectedDay ? 'inset 0 0 0 2px rgba(65,105,225,0.18)' : undefined }}>
+        <div style={{ ...styles.dayHeader, borderBottom: isSelectedDay ? '2px solid #4169E1' : '1px solid #eee' }}>
           <div>
             <div style={{fontWeight:700}}>{day.format('ddd')}</div>
             <div style={{fontSize:12,color:'#666'}}>{day.format('MMM D')}</div>
           </div>
-          <div>
-            <button onClick={() => openNewModal(day.format('YYYY-MM-DD'))} style={styles.slotButton}>+ slot</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={() => openNewModal(day)} style={styles.slotButton}>+ slot</button>
+            {isSelectedDay && modalOpen && !editing && (
+              <div style={styles.creatingBadge}>Creating for {day.format('MMM D')}</div>
+            )}
           </div>
         </div>
 
-        {/* all-day */}
         <div style={styles.allDayRow}>
           {allDayEvents.length === 0 ? <div style={{color:'#999',fontSize:12}}>No all-day</div> :
             allDayEvents.map(ev => (
@@ -366,7 +389,6 @@ export default function CalendarPage({ session }) {
           }
         </div>
 
-        {/* timeline (absolute positioned events) */}
         <div style={{...styles.timelineContainer, height: TIMELINE_HEIGHT_PX}}>
           {laidEvents.map(l => {
             const evOrig = l.orig;
@@ -382,7 +404,6 @@ export default function CalendarPage({ session }) {
             return (
               <div key={l.id}
                    role="button" tabIndex={0}
-                   onClick={() => openEditModal(evOrig)}
                    onKeyDown={e => { if (e.key === 'Enter') openEditModal(evOrig); }}
                    onMouseEnter={e => showTooltip(e, evOrig)}
                    onMouseMove={moveTooltip}
@@ -393,27 +414,28 @@ export default function CalendarPage({ session }) {
                      left: `calc(${leftPercent}% + 6px)`,
                      width: `calc(${widthPercent}% - 12px)`,
                      height: heightPx,
+                     borderLeft: '4px solid #4169E1', // royal-blue accent
+                     background: '#f4f7ff'
                    }}
                    onPointerDown={(e) => startMove(e, l)}
               >
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
                   <div style={{fontWeight:700,fontSize:12,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{evOrig.title}</div>
-                  {/* resize handle */}
-                  <div style={{width:8, height:8, borderRadius:4, background:'#0008', cursor:'ns-resize'}} 
-                       onPointerDown={(ev) => { ev.stopPropagation(); startResize(ev, l); }} />
+                  <div
+                       style={{width:10, height:10, borderRadius:4, background:'#0008', cursor:'ns-resize'}}
+                       onPointerDown={(ev) => { ev.stopPropagation(); startResize(ev, l); }}
+                  />
                 </div>
                 <div style={{fontSize:11, color:'#333'}}>{fmtTime(startMs)} — {fmtTime(endMs)}</div>
               </div>
             );
           })}
 
-          {/* invisible hour rows to maintain height */}
           <div style={{position:'absolute', inset:0}}>
             {hours.map(h => <div key={h} style={styles.hourRow} />)}
           </div>
         </div>
 
-        {/* quick list */}
         <div style={{marginTop:8}}>
           {timedEvents.length === 0 ? <div style={{color:'#999',fontSize:12}}>No events</div> :
             timedEvents.map(ev => (
@@ -438,7 +460,6 @@ export default function CalendarPage({ session }) {
 
   return (
     <div ref={containerRef} style={styles.container}>
-      {/* header */}
       <div style={styles.header}>
         <div style={{fontSize:20,fontWeight:700}}>{view === 'week' ? 'Week Calendar' : 'Day Calendar'}</div>
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
@@ -455,7 +476,6 @@ export default function CalendarPage({ session }) {
         </div>
       </div>
 
-      {/* body */}
       <div style={{display:'flex',gap:12}}>
         <div style={styles.leftHours}>
           <div style={styles.allDayLeftHeader}>All day</div>
@@ -467,7 +487,6 @@ export default function CalendarPage({ session }) {
         </div>
       </div>
 
-      {/* tooltip */}
       {tooltip && (
         <div style={{
           position:'absolute',
@@ -488,12 +507,11 @@ export default function CalendarPage({ session }) {
         </div>
       )}
 
-      {/* modal */}
       {modalOpen && (
         <div style={styles.modalBackdrop}>
           <form onSubmit={saveEvent} style={styles.modal}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <h3 style={{margin:0}}>{editing ? 'Edit event' : 'New event'}</h3>
+              <h3 style={{margin:0}}>{editing ? 'Edit event' : `New event — ${dayjs(selectedDate).format('MMM D, YYYY')}`}</h3>
               <div>
                 {editing && <button type="button" onClick={() => { if (confirm('Delete event?')) deleteEvent(editing.id); }} style={styles.dangerBtn}>Delete</button>}
                 <button type="button" onClick={() => setModalOpen(false)} style={styles.btn}>Close</button>
@@ -529,7 +547,7 @@ export default function CalendarPage({ session }) {
   );
 }
 
-/* Styles (clean / Google-like) */
+/* Theme: royal-blue accent (#4169E1) */
 const styles = {
   container: { background:'#fff', padding:18, borderRadius:10, fontFamily:`Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial`, color:'#111', position:'relative' },
   header: { display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12 },
@@ -537,8 +555,8 @@ const styles = {
   primaryTab: { padding:'6px 10px', borderRadius:8, border:'1px solid #111', background:'#111', color:'#fff', cursor:'pointer' },
   btn: { padding:'6px 10px', borderRadius:8, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer' },
   iconBtn: { padding:'6px 8px', borderRadius:8, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer' },
-  addBtn: { padding:'8px 12px', borderRadius:8, border:'none', background:'#1a73e8', color:'#fff', cursor:'pointer' },
-  dangerBtn: { marginRight:8, padding:'6px 8px', borderRadius:8, border:'1px solid #e6b0b0', background:'#fff', color:'#b22' },
+  addBtn: { padding:'8px 12px', borderRadius:8, border:'none', background:'#4169E1', color:'#fff', cursor:'pointer', boxShadow:'0 6px 18px rgba(65,105,225,0.12)' },
+  dangerBtn: { marginRight:8, padding:'6px 8px', borderRadius:8, border:'1px solid #ef9a9a', background:'#fff', color:'#b22' },
 
   leftHours: { width:80, flexShrink:0 },
   allDayLeftHeader: { height:40, borderBottom:'1px solid #eee', display:'flex',alignItems:'center',justifyContent:'center',fontSize:12, color:'#444' },
@@ -547,11 +565,12 @@ const styles = {
   column: { minWidth:260, borderLeft:'1px solid #f0f0f0', borderRight:'1px solid #f0f0f0', borderRadius:6, background:'#fafafa', padding:8, boxSizing:'border-box' },
   dayHeader: { height:56, display:'flex',alignItems:'center',justifyContent:'space-between', padding:'0 8px', borderBottom:'1px solid #eee' },
   slotButton: { padding:'6px 8px', borderRadius:6, border:'1px solid #e6e6e6', background:'#fff', cursor:'pointer', fontSize:12 },
+  creatingBadge: { background:'#4169E1', color:'#fff', padding:'4px 8px', borderRadius:6, fontSize:12 },
 
   allDayRow: { minHeight:48, borderBottom:'1px solid #eee', marginBottom:6, display:'flex', gap:6, alignItems:'center', padding:6, flexWrap:'wrap' },
   allDayChip: { padding:'6px 10px', background:'#fcefe6', borderRadius:8, fontSize:13, cursor:'pointer', border:'1px solid #f3d6c0' },
 
-  timelineContainer: { position:'relative', overflow:'hidden' }, // height set per column to big pixel value
+  timelineContainer: { position:'relative', overflow:'hidden' },
   hourRow: { height:'60px', borderBottom:'1px dashed rgba(0,0,0,0.04)' },
 
   eventCard: { position:'absolute', padding:8, boxSizing:'border-box', borderRadius:8, overflow:'hidden', cursor:'pointer', background:'#e7f3ff', border:'1px solid #cfe6ff' },
@@ -561,5 +580,5 @@ const styles = {
   modalBackdrop: { position:'fixed', inset:0, display:'flex', alignItems:'center', justifyContent:'center', background:'rgba(0,0,0,0.35)', zIndex:1000 },
   modal: { background:'#fff', padding:18, borderRadius:10, width:520, boxShadow:'0 10px 40px rgba(2,6,23,0.2)' },
   input: { padding:8, borderRadius:6, border:'1px solid #e6e6e6', width:'100%' },
-  primary: { padding:'8px 12px', borderRadius:8, border:'none', background:'#1a73e8', color:'#fff', cursor:'pointer' },
+  primary: { padding:'8px 12px', borderRadius:8, border:'none', background:'#4169E1', color:'#fff', cursor:'pointer' },
 };

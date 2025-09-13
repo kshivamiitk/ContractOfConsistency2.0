@@ -16,6 +16,7 @@ import CalendarPage from './pages/CalendarPage';
 import ChatPage from './pages/ChatPage';
 import Pomodoro from './components/Pomodoro';
 import UnreadMessagesPopup from './components/UnreadMessagesPopup';
+import ConsistencyPage from './pages/ConsistencyPage';
 
 export default function App() {
   const [session, setSession] = useState(null);
@@ -61,6 +62,7 @@ export default function App() {
           {/* pass the prop to ChatPage so it can call onUnreadChange(totalUnread) */}
           <Route path="/chat" element={<ChatPage session={session} onUnreadChange={handleUnreadChange} />} />
           <Route path="/pomodoro" element={<Pomodoro />} />
+          <Route path="consistency" element={<ConsistencyPage/>}/>
           <Route path="/" element={<LoginPage />} />
         </Routes>
       </main>
