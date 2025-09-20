@@ -10,6 +10,7 @@ export default function Navbar({ session }) {
 
   return (
     <nav style={{ display: 'flex', gap: 16, padding: 12, borderBottom: '1px solid #eee' }}>
+      <Link to="/announcements">Announcements</Link>
       <Link to="/preferences">Preferences</Link>
       <Link to="/checklist">Checklist</Link>
       <Link to="/search">Search</Link>

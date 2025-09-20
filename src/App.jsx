@@ -17,6 +17,7 @@ import ChatPage from './pages/ChatPage';
 import Pomodoro from './components/Pomodoro';
 import UnreadMessagesPopup from './components/UnreadMessagesPopup';
 import ConsistencyPage from './pages/ConsistencyPage';
+import AnnouncementPage from './pages/AnnouncementPage';
 
 export default function App() {
   const [session, setSession] = useState(null);
@@ -30,7 +31,7 @@ export default function App() {
 
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) navigate('/preferences');
+      if (session) navigate('/announcements'); // <--- default logged-in page
       else navigate('/login');
     });
 
@@ -39,7 +40,6 @@ export default function App() {
     };
   }, []);
 
-  // handler passed into ChatPage so it can notify App about unread total
   const handleUnreadChange = (totalUnread) => {
     setUnreadCount(Number(totalUnread || 0));
   };
@@ -51,6 +51,7 @@ export default function App() {
       <main style={{ padding: 20 }}>
         <Routes>
           <Route path="/login" element={<LoginPage />} />
+          <Route path="/announcements" element={<AnnouncementPage session={session} />} />
           <Route path="/preferences" element={<PreferencesPage />} />
           <Route path="/checklist" element={<ChecklistPage />} />
           <Route path="/search" element={<SearchPage />} />
@@ -59,11 +60,10 @@ export default function App() {
           <Route path="/tasks" element={<TaskRegistryPage />} />
           <Route path="/diary" element={<DiaryPage session={session} />} />
           <Route path="/calendar" element={<CalendarPage session={session} />} />
-          {/* pass the prop to ChatPage so it can call onUnreadChange(totalUnread) */}
           <Route path="/chat" element={<ChatPage session={session} onUnreadChange={handleUnreadChange} />} />
           <Route path="/pomodoro" element={<Pomodoro />} />
           <Route path="consistency" element={<ConsistencyPage/>}/>
-          <Route path="/" element={<LoginPage />} />
+          <Route path="/" element={<AnnouncementPage session={session} />} />
         </Routes>
       </main>
     </div>
